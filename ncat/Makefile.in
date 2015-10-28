@@ -201,7 +201,7 @@ TESTS += ./test-wildcard
 endif
 
 check: $(TARGET) $(TEST_PROGS)
-	cd test && ./ncat-test.pl
+	cd test && strace -ff ./ncat-test.pl
 	cd test && ($(addsuffix &&,$(TESTS)) echo "All tests passed.")
 
 # Tell versions [3.59,3.63) of GNU make to not export all variables.
