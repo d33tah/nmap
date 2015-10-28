@@ -5,6 +5,7 @@ compiler:
 # Change this to your needs
 sudo: true
 script: sudo apt-get install liburi-perl libsocket6-perl libhttp-message-perl -y; mkdir /tmp/n && CFLAGS="-O0 -g -fno-inline -fprofile-arcs -ftest-coverage" CXXFLAGS="-O0 -g -fno-inline -fprofile-arcs -ftest-coverage" LDFLAGS="-fprofile-arcs" ./configure $SSL_FLAG $LUA_FLAG --prefix=/tmp/n && make && make check && make install && /tmp/n/bin/nmap -A scanme.nmap.org
+dist: trusty
 
 env:
   - SSL_FLAG="--without-ssl" LUA_FLAG="--without-liblua"
