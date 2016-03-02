@@ -295,6 +295,12 @@ struct niod {
   void *ipopts;
   int ipoptslen;
 
+  int ttl;
+
+  /* structure used to trigger connection lingering */
+  struct linger lingeropts;
+  int lingeropts_set;
+
   /* Pointer to mspcap struct (used only if pcap support is included) */
   void *pcap;
 

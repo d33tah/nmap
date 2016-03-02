@@ -135,6 +135,7 @@
 #include "tcpip.h"
 #include <list>
 #include <vector>
+#include "nsock.h"
 
 struct probespec_tcpdata {
   u16 dport;
@@ -218,7 +219,10 @@ class ConnectProbe {
 public:
   ConnectProbe();
   ~ConnectProbe();
-  int sd; /* Socket descriptor used for connection.  -1 if not valid. */
+  bool connected;
+  nsock_iod sock_nsi;
+  int connect_result;
+  bool self_connect;
 };
 
 struct IPExtraProbeData_icmp {
@@ -359,21 +363,9 @@ public:
   ConnectScanInfo();
   ~ConnectScanInfo();
 
-  /* Watch a socket descriptor (add to fd_sets and maxValidSD).  Returns
-     true if the SD was absent from the list, false if you tried to
-     watch an SD that was already being watched. */
-  bool watchSD(int sd);
-
-  /* Clear SD from the fd_sets and maxValidSD.  Returns true if the SD
-   was in the list, false if you tried to clear an sd that wasn't
-   there in the first place. */
-  bool clearSD(int sd);
-  int maxValidSD; /* The maximum socket descriptor in any of the fd_sets */
-  fd_set fds_read;
-  fd_set fds_write;
-  fd_set fds_except;
   int numSDs; /* Number of socket descriptors being watched */
   int maxSocketsAllowed; /* No more than this many sockets may be created @once */
+  nsock_pool nsp;
 };
 
 class HostScanStats;

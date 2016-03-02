@@ -835,7 +835,10 @@ static void set_default_port_state(std::vector<Target *> &targets, stype scantyp
     case ACK_SCAN:
     case WINDOW_SCAN:
     case CONNECT_SCAN:
-      (*target)->ports.setDefaultPortState(IPPROTO_TCP, PORT_FILTERED);
+      if (o.proxy_chain)
+        (*target)->ports.setDefaultPortState(IPPROTO_TCP, PORT_CLOSEDFILTERED);
+      else
+        (*target)->ports.setDefaultPortState(IPPROTO_TCP, PORT_FILTERED);
       break;
     case SCTP_INIT_SCAN:
       (*target)->ports.setDefaultPortState(IPPROTO_SCTP, PORT_FILTERED);
@@ -1567,11 +1570,10 @@ void HostScanStats::destroyOutstandingProbe(std::list<UltraProbe *>::iterator pr
     num_probes_waiting_retransmit--;
   }
 
-  /* Remove it from scan watch lists, if it exists on them. */
-  if (probe->type == UltraProbe::UP_CONNECT && probe->CP()->sd > 0)
-    USI->gstats->CSI->clearSD(probe->CP()->sd);
-
   probes_outstanding.erase(probeI);
+  if (o.debugging > 8)
+    log_write(LOG_PLAIN, "HostScanStats::destroyOutstandingProbe[%p]"
+              " - Deleting probe dport=%d\n", probe, probe->dport());
   delete probe;
 }
 
@@ -1686,12 +1688,15 @@ void HostScanStats::markProbeTimedout(std::list<UltraProbe *>::iterator probeI) 
     /* I'll leave it in the queue in case some response ever does come */
     num_probes_waiting_retransmit++;
 
-  if (probe->type == UltraProbe::UP_CONNECT && probe->CP()->sd >= 0 ) {
+  if (probe->type == UltraProbe::UP_CONNECT && probe->CP()->connected ) {
     /* Free the socket as that is a valuable resource, though it is a shame
        late responses will not be permitted */
-    USI->gstats->CSI->clearSD(probe->CP()->sd);
-    close(probe->CP()->sd);
-    probe->CP()->sd = -1;
+    if (probe->CP()->connected) {
+      if (o.debugging > 8)
+        log_write(LOG_PLAIN, "HostScanStats::markProbeTimedout: nsock_iod_delete (probe->dport()=%d)\n", probe->dport());
+      nsock_iod_delete(probe->CP()->sock_nsi, NSOCK_PENDING_SILENT);
+      probe->CP()->connected = false;
+    }
   }
 }
 
@@ -1953,6 +1958,9 @@ void HostScanStats::moveProbeToBench(std::list<UltraProbe *>::iterator probeI) {
   probe_bench.push_back(*probe->pspec());
   probes_outstanding.erase(probeI);
   num_probes_waiting_retransmit--;
+  if (o.debugging > 8)
+    log_write(LOG_PLAIN, "HostScanStats::moveProbeToBench[%p]"
+              " - Deleting probe dport=%d\n", probe, probe->dport());
   delete probe;
 }
 

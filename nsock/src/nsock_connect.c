@@ -104,6 +104,21 @@ static int mksock_set_ipopts(struct npool *ms, struct niod *iod) {
   return 0;
 }
 
+static int mksock_set_ttl(struct npool *ms, struct niod *iod) {
+  int rc;
+
+  errno = 0;
+  rc = setsockopt(iod->sd, IPPROTO_IP, IP_TTL, (const char *) &(iod->ttl),
+                  iod->ttl);
+  if (rc == -1) {
+    int err = socket_errno();
+
+    nsock_log_error("Setting of TTL failed (IOD #%li): %s (%d)",
+                    iod->id, socket_strerror(err), err);
+  }
+  return 0;
+}
+
 static int mksock_bind_device(struct npool *ms, struct niod *iod) {
   int rc;
 
@@ -158,6 +173,9 @@ static int nsock_make_socket(struct npool *ms, struct niod *iod, int family, int
 
   if (iod->ipoptslen && family == AF_INET)
     mksock_set_ipopts(ms, iod);
+
+  if (iod->ttl != -1)
+    mksock_set_ttl(ms, iod);
 
   if (ms->device)
     mksock_bind_device(ms, iod);

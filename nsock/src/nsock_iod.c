@@ -136,6 +136,9 @@ nsock_iod nsock_iod_new2(nsock_pool nsockp, int sd, void *userdata) {
   nsi->ipopts = NULL;
   nsi->ipoptslen = 0;
 
+  nsi->ttl = -1;
+  nsi->lingeropts_set = 0;
+
 #if HAVE_OPENSSL
   nsi->ssl_session = NULL;
 #endif
@@ -400,6 +403,28 @@ int nsock_iod_set_ipoptions(nsock_iod iod, void *opts, size_t optslen) {
   nsi->ipopts = safe_malloc(optslen);
   memcpy(nsi->ipopts, opts, optslen);
   nsi->ipoptslen = optslen;
+  return 0;
+}
+
+/* Sets IPv4 TTL to apply before connect(). */
+int nsock_iod_set_ttl(nsock_iod iod, int ttl) {
+  struct niod *nsi = (struct niod *)iod;
+
+  assert(nsi);
+
+  nsi->ttl = ttl;
+  return 0;
+}
+
+/* Sets connection lingering options to apply before connect().  It makes a copy
+ * of the options, so you can free() yours if necessary.  This copy is freed
+ * when the iod is destroyed */
+int nsock_iod_set_linger(nsock_iod nsi, struct linger lingeropts_arg)
+{
+  struct niod *iod = (struct niod *)nsi;
+  assert(iod);
+  iod->lingeropts = lingeropts_arg;
+  iod->lingeropts_set = 1;
   return 0;
 }
 

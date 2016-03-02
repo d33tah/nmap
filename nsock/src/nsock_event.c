@@ -460,7 +460,18 @@ struct nevent *event_new(struct npool *nsp, enum nse_type type,
 #endif
 
   if (timeout_msecs != -1) {
-    assert(timeout_msecs >= 0);
+    /* assert(timeout_msecs >= 0); */
+
+    /* FIXME: port scanning behind SOCKS4 fails on the assertion above, most
+       likely because of problems with the reliability of gettimeofday. This
+       conditional statement is a kludge meant to make SOCKS4 port scanning
+       work. This should be removed and the underlying problem actually
+       solved.
+
+       Also see here: http://seclists.org/nmap-dev/2015/q2/375
+    */
+    if (timeout_msecs < 0)
+      timeout_msecs = 0;
     TIMEVAL_MSEC_ADD(nse->timeout, nsock_tod, timeout_msecs);
   }
 

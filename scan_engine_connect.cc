@@ -145,7 +145,6 @@ void UltraProbe::setConnect(u16 portno) {
 }
 
 ConnectScanInfo::ConnectScanInfo() {
-  maxValidSD = -1;
   numSDs = 0;
   if (o.max_parallelism > 0) {
     maxSocketsAllowed = o.max_parallelism;
@@ -166,59 +165,18 @@ ConnectScanInfo::ConnectScanInfo() {
       maxSocketsAllowed = 5;
   }
   maxSocketsAllowed = MIN(maxSocketsAllowed, FD_SETSIZE - 10);
-  FD_ZERO(&fds_read);
-  FD_ZERO(&fds_write);
-  FD_ZERO(&fds_except);
+  nsp = nsock_pool_new(NULL);
+  nsock_set_log_function(nmap_nsock_stderr_logger);
+  nsock_pool_set_device(nsp, o.device);
+
+  if (o.proxy_chain) {
+    nsock_pool_set_proxychain(nsp, o.proxy_chain);
+  }
 }
 
 /* Nothing really to do here. */
-ConnectScanInfo::~ConnectScanInfo() {}
-
-/* Watch a socket descriptor (add to fd_sets and maxValidSD).  Returns
-   true if the SD was absent from the list, false if you tried to
-   watch an SD that was already being watched. */
-bool ConnectScanInfo::watchSD(int sd) {
-  assert(sd >= 0);
-  if (!checked_fd_isset(sd, &fds_read)) {
-    checked_fd_set(sd, &fds_read);
-    checked_fd_set(sd, &fds_write);
-    checked_fd_set(sd, &fds_except);
-    numSDs++;
-    if (sd > maxValidSD)
-      maxValidSD = sd;
-    return true;
-  } else {
-    return false;
-  }
-}
-
-/* Clear SD from the fd_sets and maxValidSD.  Returns true if the SD
-   was in the list, false if you tried to clear an sd that wasn't
-   there in the first place. */
-bool ConnectScanInfo::clearSD(int sd) {
-  assert(sd >= 0);
-  if (checked_fd_isset(sd, &fds_read)) {
-    checked_fd_clr(sd, &fds_read);
-    checked_fd_clr(sd, &fds_write);
-    checked_fd_clr(sd, &fds_except);
-    assert(numSDs > 0);
-    numSDs--;
-    if (sd == maxValidSD)
-      maxValidSD--;
-    return true;
-  } else {
-    return false;
-  }
-}
-
-ConnectProbe::ConnectProbe() {
-  sd = -1;
-}
-
-ConnectProbe::~ConnectProbe() {
-  if (sd > 0)
-    close(sd);
-  sd = -1;
+ConnectScanInfo::~ConnectScanInfo() {
+  nsock_pool_delete(nsp);
 }
 
 static void handleConnectResult(UltraScanInfo *USI, HostScanStats *hss,
@@ -230,8 +188,6 @@ static void handleConnectResult(UltraScanInfo *USI, HostScanStats *hss,
   int newhoststate = HOST_UNKNOWN;
   reason_t current_reason = ER_NORESPONSE;
   UltraProbe *probe = *probeI;
-  struct sockaddr_storage local;
-  socklen_t local_len = sizeof(struct sockaddr_storage);
   struct sockaddr_storage remote;
   size_t remote_len;
 
@@ -323,38 +279,8 @@ static void handleConnectResult(UltraScanInfo *USI, HostScanStats *hss,
        ultrascan_port_probe_update deletes probe. */
     u8 protocol = probe->protocol();
     u16 dport = probe->dport();
-    /* getsockname can fail on AIX when socket is closed
-     * and we only care about self-connects for open ports anyway
-     */
-    if (newportstate == PORT_OPEN) {
-      /* Check for self-connected probe */
-      if (getsockname(probe->CP()->sd, (struct sockaddr*)&local, &local_len) == 0) {
-        if (sockaddr_storage_cmp(&local, &remote) == 0 && (
-              (local.ss_family == AF_INET &&
-               ((struct sockaddr_in*)&local)->sin_port == htons(dport))
-#if HAVE_IPV6
-              || (local.ss_family == AF_INET6 &&
-                ((struct sockaddr_in6*)&local)->sin6_port == htons(dport))
-#endif
-              )) {
-          if (o.debugging) {
-            log_write(LOG_STDOUT, "Detected likely self-connect on port %d\n", probe->dport());
-          }
-          /* It's not really timed out, but this is a simple way to retry the
-           * probe. It shouldn't affect timing too much, since this is quite
-           * rare (should average one per scan, for localhost -p 0-65535 scans
-           * only) */
-          hss->markProbeTimedout(probeI);
-        }
-        else {
-          ultrascan_port_probe_update(USI, hss, probeI, newportstate, &USI->now, adjust_timing);
-          hss->target->ports.setStateReason(dport, protocol, current_reason, 0, NULL);
-        }
-      }
-      else {
-        gh_perror("getsockname or TargetSockAddr failed");
-      }
-    }
+    if (newportstate == PORT_OPEN && probe->CP()->self_connect)
+      hss->markProbeTimedout(probeI);
     else {
       ultrascan_port_probe_update(USI, hss, probeI, newportstate, &USI->now, adjust_timing);
       hss->target->ports.setStateReason(dport, protocol, current_reason, 0, NULL);
@@ -365,38 +291,89 @@ static void handleConnectResult(UltraScanInfo *USI, HostScanStats *hss,
   return;
 }
 
-/* Set the socket lingering so we will RST connections instead of wasting
-   bandwidth with the four-step close. Set the source address if needed. Bind to
-   a specific interface if needed. */
-static void init_socket(int sd) {
-  static int bind_failed = 0;
-  struct linger l;
-  struct sockaddr_storage ss;
-  size_t sslen;
+ConnectProbe::ConnectProbe() {
+  connected = false;
+  self_connect = false;
+  connect_result = -2;
+}
 
-  l.l_onoff = 1;
-  l.l_linger = 0;
+ConnectProbe::~ConnectProbe() {
+  if (o.debugging > 8)
+    log_write(LOG_PLAIN, "ConnectProbe::~ConnectProbe[%p]"
+              ", connected=%d\n", this, connected);
+  if (connected)
+    nsock_iod_delete(sock_nsi, NSOCK_PENDING_SILENT);
+}
 
-  if (setsockopt(sd, SOL_SOCKET, SO_LINGER, (const char *) &l, sizeof(l)) != 0) {
-    error("Problem setting socket SO_LINGER, errno: %d", socket_errno());
-    perror("setsockopt");
-  }
-  if (o.spoofsource && !bind_failed) {
-    o.SourceSockAddr(&ss, &sslen);
-    if (::bind(sd, (struct sockaddr*)&ss, sslen) != 0) {
-      error("%s: Problem binding source address (%s), errno: %d", __func__, inet_socktop(&ss), socket_errno());
-      perror("bind");
-      bind_failed = 1;
+static bool is_self_connect(int sd, int dport, Target *target) {
+  struct sockaddr_storage local;
+  socklen_t local_len = sizeof(struct sockaddr_storage);
+  struct sockaddr_storage remote;
+  size_t remote_len;
+
+  if (getsockname(sd, (struct sockaddr*)&local, &local_len) == 0
+    && target->TargetSockAddr(&remote, &remote_len) == 0) {
+    if (sockaddr_storage_cmp(&local, &remote) == 0 && (
+          (local.ss_family == AF_INET &&
+            ((struct sockaddr_in*)&local)->sin_port == htons(dport))
+#if HAVE_IPV6
+          || (local.ss_family == AF_INET6 &&
+            ((struct sockaddr_in6*)&local)->sin6_port == htons(dport))
+#endif
+          )) {
+      return true;
     }
   }
-  errno = 0;
-  if (!socket_bindtodevice(sd, o.device)) {
-    /* EPERM is expected when not running as root. */
-    if (errno != EPERM) {
-      error("Problem binding to interface %s, errno: %d", o.device, socket_errno());
-      perror("socket_bindtodevice");
-    }
+  else {
+    gh_perror("getsockname or TargetSockAddr failed");
   }
+  return false;
+}
+
+struct probe_and_hss {
+  UltraProbe *probe;
+  HostScanStats *hss;
+};
+
+void connectHandler(nsock_pool nsp, nsock_event evt, void* data) {
+  probe_and_hss *data_struct = (probe_and_hss*)data;
+  UltraProbe *probe = data_struct->probe;
+  HostScanStats *hss = data_struct->hss;
+  delete data_struct;
+
+  nsock_iod nsi = nse_iod(evt);
+  enum nse_status status = nse_status(evt);
+  enum nse_type type = nse_type(evt);
+
+  assert(type == NSE_TYPE_CONNECT);
+  int connect_errno = nse_errorcode(evt);
+  assert(status != NSE_STATUS_SUCCESS || (status == NSE_STATUS_SUCCESS && connect_errno == 0));
+  if (status == NSE_STATUS_TIMEOUT)
+    connect_errno = ETIMEDOUT;
+
+  if (status == NSE_STATUS_PROXYERROR) {
+    nsock_iod_delete(nsi, NSOCK_PENDING_SILENT);
+    return;
+  }
+
+  probe->CP()->connect_result = connect_errno;
+  if (o.debugging > 5)
+    log_write(LOG_PLAIN, "connectHandler: connect_errno=%d, status=%s, portno=%d.\n",
+                connect_errno, nse_status2str(status), probe->dport());
+
+
+  /* XXX: I'm getting the following error:
+     nmap: scan_engine.cc:1673: void HostScanStats::markProbeTimedout(std::list<UltraProbe*>::iterator): Assertion `!probe->timedout' failed.
+      Also, perhaps it's worth checking if we're behind proxy instead of doing
+      this check all the time? */
+  if (status != NSE_STATUS_KILL) {
+    if (is_self_connect(nsock_iod_get_sd(nsi), probe->dport(), hss->target)) {
+      probe->CP()->self_connect = true;
+    }
+
+    nsock_iod_delete(nsi, NSOCK_PENDING_SILENT);
+  }
+  probe->CP()->connected = false;
 }
 
 /* If this is NOT a ping probe, set pingseq to 0.  Otherwise it will be the
@@ -406,14 +383,6 @@ UltraProbe *sendConnectScanProbe(UltraScanInfo *USI, HostScanStats *hss,
 
   UltraProbe *probe = new UltraProbe();
   std::list<UltraProbe *>::iterator probeI;
-  int rc;
-  int connect_errno = 0;
-  struct sockaddr_storage sock;
-  struct sockaddr_in *sin = (struct sockaddr_in *) &sock;
-#if HAVE_IPV6
-  struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *) &sock;
-#endif
-  size_t socklen;
   ConnectProbe *CP;
 
   probe->tryno = tryno;
@@ -421,30 +390,54 @@ UltraProbe *sendConnectScanProbe(UltraScanInfo *USI, HostScanStats *hss,
   /* First build the probe */
   probe->setConnect(destport);
   CP = probe->CP();
-  /* Initiate the connection */
-  CP->sd = socket(o.af(), SOCK_STREAM, IPPROTO_TCP);
-  if (CP->sd == -1)
-    pfatal("Socket creation in %s", __func__);
-  unblock_socket(CP->sd);
-  init_socket(CP->sd);
-  set_ttl(CP->sd, o.ttl);
-  if (o.ipoptionslen)
-    set_ipoptions(CP->sd, o.ipoptions, o.ipoptionslen);
-  if (hss->target->TargetSockAddr(&sock, &socklen) != 0) {
-    fatal("Failed to get target socket address in %s", __func__);
+
+  CP->sock_nsi = nsock_iod_new(USI->gstats->CSI->nsp, NULL);
+  if (CP->sock_nsi == NULL)
+    fatal("Failed to create nsock_iod.");
+
+  /* Set the socket lingering so we will RST connections instead of wasting
+     bandwidth with the four-step close. */
+  struct linger l;
+  l.l_onoff = 1;
+  l.l_linger = 0;
+  nsock_iod_set_linger(CP->sock_nsi, l);
+
+  /* Spoof the source IP address. The following is copied from l_connect from
+     nse_nsock.cc. */
+  if (o.spoofsource) {
+    struct sockaddr_storage ss;
+    size_t sslen;
+
+    o.SourceSockAddr(&ss, &sslen);
+    nsock_iod_set_localaddr(CP->sock_nsi, &ss, sslen);
   }
-  if (sin->sin_family == AF_INET)
-    sin->sin_port = htons(probe->pspec()->pd.tcp.dport);
-#if HAVE_IPV6
-  else sin6->sin6_port = htons(probe->pspec()->pd.tcp.dport);
-#endif
+
+  /* Set the IP TTL value. */
+  nsock_iod_set_ttl(CP->sock_nsi, o.ttl);
+
+  /* Set any IP options user requested. */
+  if (o.ipoptionslen)
+    nsock_iod_set_ipoptions(CP->sock_nsi, o.ipoptions, o.ipoptionslen);
+
+  /* Translate target's IP to struct sockaddr_storage. */
+  struct sockaddr_storage targetss;
+  size_t targetsslen;
+  if (hss->target->TargetSockAddr(&targetss, &targetsslen) != 0)
+    fatal("Failed to get target socket address in %s", __func__);
+
   probe->sent = USI->now;
   /* We don't record a byte count for connect probes. */
   hss->probeSent(0);
-  rc = connect(CP->sd, (struct sockaddr *)&sock, socklen);
+  probe_and_hss *userdata = new probe_and_hss();
+  userdata->probe = probe;
+  userdata->hss = hss;
+  nsock_connect_tcp(USI->gstats->CSI->nsp, CP->sock_nsi, connectHandler,
+                    1000, /* timeout */
+                    userdata,
+                    (struct sockaddr *)&targetss, targetsslen,
+                    probe->pspec()->pd.tcp.dport);
+  probe->CP()->connected = true;
   gettimeofday(&USI->now, NULL);
-  if (rc == -1)
-    connect_errno = socket_errno();
   /* This counts as probe being sent, so update structures */
   hss->probes_outstanding.push_back(probe);
   probeI = hss->probes_outstanding.end();
@@ -456,14 +449,9 @@ UltraProbe *sendConnectScanProbe(UltraScanInfo *USI, HostScanStats *hss,
      or permanently fail here, so related code cood all be localized
      elsewhere.  But the reality is that connect() MAY be finished now. */
 
-  if (rc == -1 && (connect_errno == EINPROGRESS || connect_errno == EAGAIN)) {
-    PacketTrace::traceConnect(IPPROTO_TCP, (sockaddr *) &sock, socklen, rc,
-        connect_errno, &USI->now);
-    USI->gstats->CSI->watchSD(CP->sd);
-  } else {
-    handleConnectResult(USI, hss, probeI, connect_errno, true);
-    probe = NULL;
-  }
+  /* XXX: static void PacketTrace::traceConnect(u8, const sockaddr*, int, int, int, const timeval*): Assertion `sin->sin_family == 10' failed. */
+  //PacketTrace::traceConnect(IPPROTO_TCP, (sockaddr *) &sock, socklen, rc,
+  //    connect_errno, &USI->now);
   gettimeofday(&USI->now, NULL);
   return probe;
 }
@@ -473,39 +461,20 @@ UltraProbe *sendConnectScanProbe(UltraScanInfo *USI, HostScanStats *hss,
    quick select() just in case.  Returns true if at least one good result
    (generally a port state change) is found, false if it times out instead */
 bool do_one_select_round(UltraScanInfo *USI, struct timeval *stime) {
-  fd_set fds_rtmp, fds_wtmp, fds_xtmp;
-  int selectres;
-  struct timeval timeout;
-  int timeleft;
+  int selectres = 1;
   ConnectScanInfo *CSI = USI->gstats->CSI;
-  int sd;
   std::list<HostScanStats *>::iterator hostI;
   HostScanStats *host;
   UltraProbe *probe = NULL;
-  int optval;
-  recvfrom6_t optlen = sizeof(int);
   int numGoodSD = 0;
   int err = 0;
 
   do {
-    timeleft = TIMEVAL_MSEC_SUBTRACT(*stime, USI->now);
-    if (timeleft < 0)
-      timeleft = 0;
-    fds_rtmp = USI->gstats->CSI->fds_read;
-    fds_wtmp = USI->gstats->CSI->fds_write;
-    fds_xtmp = USI->gstats->CSI->fds_except;
-    timeout.tv_sec = timeleft / 1000;
-    timeout.tv_usec = (timeleft % 1000) * 1000;
+    int timeleft_ms = TIMEVAL_MSEC_SUBTRACT(*stime, USI->now);
+    if (timeleft_ms < 0)
+      timeleft_ms = 0;
 
-    if (CSI->numSDs) {
-      selectres = select(CSI->maxValidSD + 1, &fds_rtmp, &fds_wtmp,
-                         &fds_xtmp, &timeout);
-      err = socket_errno();
-    } else {
-      /* Apparently Windows returns an WSAEINVAL if you select without watching any SDs.  Lame.  We'll usleep instead in that case */
-      usleep(timeleft * 1000);
-      selectres = 0;
-    }
+    nsock_loop(CSI->nsp, timeleft_ms);
   } while (selectres == -1 && err == EINTR);
 
   gettimeofday(&USI->now, NULL);
@@ -524,8 +493,9 @@ bool do_one_select_round(UltraScanInfo *USI, struct timeval *stime) {
   incompleteHostI = USI->incompleteHosts.begin();
   completedHostI = USI->completedHosts.begin();
   while ((incompleteHostI != USI->incompleteHosts.end()
-          || completedHostI != USI->completedHosts.end())
-         && numGoodSD < selectres) {
+          || completedHostI != USI->completedHosts.end())) {
+
+
     if (incompleteHostI != USI->incompleteHosts.end())
       hostI = incompleteHostI++;
     else
@@ -537,7 +507,7 @@ bool do_one_select_round(UltraScanInfo *USI, struct timeval *stime) {
 
     std::list<UltraProbe *>::iterator nextProbeI;
     for (std::list<UltraProbe *>::iterator probeI = host->probes_outstanding.begin(), end = host->probes_outstanding.end();
-        probeI != end && numGoodSD < selectres && host->num_probes_outstanding() > 0; probeI = nextProbeI) {
+        probeI != end && host->num_probes_outstanding() > 0; probeI = nextProbeI) {
       /* handleConnectResult may remove the probe at probeI, which invalidates
        * the iterator. We copy and increment it here instead of in the for-loop
        * statement to avoid incrementing an invalid iterator */
@@ -545,18 +515,17 @@ bool do_one_select_round(UltraScanInfo *USI, struct timeval *stime) {
       nextProbeI++;
       probe = *probeI;
       assert(probe->type == UltraProbe::UP_CONNECT);
-      sd = probe->CP()->sd;
-      /* Let see if anything has happened! */
-      if (sd >= 0 && (checked_fd_isset(sd, &fds_rtmp) ||
-                      checked_fd_isset(sd, &fds_wtmp) ||
-                      checked_fd_isset(sd, &fds_xtmp))) {
-        numGoodSD++;
-        if (getsockopt(sd, SOL_SOCKET, SO_ERROR, (char *) &optval,
-                       &optlen) != 0)
-          optval = socket_errno(); /* Stupid Solaris ... */
 
-        handleConnectResult(USI, host, probeI, optval);
+      int connect_errno = probe->CP()->connect_result;
+      if (connect_errno == -2)
+        connect_errno = ETIMEDOUT;
+      if (connect_errno != ETIMEDOUT) {
+        numGoodSD++;
+        if (o.debugging > 5)
+          log_write(LOG_PLAIN, "Calling handleConnectResult.\n");
+        handleConnectResult(USI, host, probeI, connect_errno);
       }
+
     }
   }
   return numGoodSD;

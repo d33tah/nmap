@@ -443,6 +443,14 @@ int nsock_iod_set_localaddr(nsock_iod iod, struct sockaddr_storage *ss, size_t s
  * destroyed */
 int nsock_iod_set_ipoptions(nsock_iod iod, void *ipopts, size_t ipoptslen);
 
+/* Sets IPv4 TTL to apply before connect(). */
+int nsock_iod_set_ttl(nsock_iod nsi, int ttl);
+
+/* Sets connection lingering options to apply before connect().  It makes a copy
+ * of the options, so you can free() yours if necessary.  This copy is freed
+ * when the iod is destroyed */
+int nsock_iod_set_linger(nsock_iod nsi, struct linger lingeropts);
+
 /* Returns that host/port/protocol information for the last communication (or
  * comm. attempt) this nsi has been involved with.  By "involved" with I mean
  * interactions like establishing (or trying to) a connection or sending a UDP
